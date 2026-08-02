@@ -2,11 +2,11 @@
 
 from importlib.metadata import version
 
-from pyground.cli import build_parser
+from scrappad.cli import build_parser
 
-distribution_version = version("pyground-repl")
+distribution_version = version("scrappad")
 parser = build_parser()
 
 assert distribution_version
-assert parser.prog == "pyground"
-print(f"pyground-repl {distribution_version} imports successfully")
+assert parser.prog == "scrappad"
+print(f"scrappad {distribution_version} imports successfully")

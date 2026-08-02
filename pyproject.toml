@@ -1,9 +1,9 @@
 [build-system]
-requires = ["hatchling>=1.26"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.9.16,<0.10.0"]
+build-backend = "uv_build"
 
 [project]
-name = "pyground-repl"
+name = "scrappad"
 version = "0.1.0"
 description = "A split-screen Python editor and live REPL for the terminal"
 readme = "README.md"
@@ -34,9 +34,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/siliconlad/pyground"
-Repository = "https://github.com/siliconlad/pyground.git"
-Issues = "https://github.com/siliconlad/pyground/issues"
+Homepage = "https://github.com/siliconlad/scrappad"
+Repository = "https://github.com/siliconlad/scrappad.git"
+Issues = "https://github.com/siliconlad/scrappad/issues"
 
 [dependency-groups]
 dev = [
@@ -44,10 +44,10 @@ dev = [
 ]
 
 [project.scripts]
-pyground = "pyground.cli:main"
+scrappad = "scrappad.cli:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/pyground"]
+[tool.uv.build-backend]
+module-name = "scrappad"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

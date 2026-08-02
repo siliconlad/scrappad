@@ -1,6 +1,6 @@
 import asyncio
 
-from pyground.kernel import KernelClient
+from scrappad.kernel import KernelClient
 
 
 def test_worker_namespace_and_interrupts_are_transactional(tmp_path) -> None:

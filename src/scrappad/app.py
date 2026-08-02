@@ -1,4 +1,4 @@
-"""Textual user interface for Pyground."""
+"""Textual user interface for Scrappad."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, Label, RichLog, Static, TextArea
 
-from .kernel import KernelClient, KernelResponse
+from scrappad.kernel import KernelClient, KernelResponse
 
 STARTER = ""
 
@@ -56,10 +56,10 @@ class ReplInput(Input):
             event.stop()
 
 
-class PygroundApp(App[None]):
+class ScrappadApp(App[None]):
     """Split-screen Python editor with a synchronized REPL."""
 
-    TITLE = "Pyground"
+    TITLE = "Scrappad"
     SUB_TITLE = "live Python scratchpad"
     HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [
         (0, "-narrow"),

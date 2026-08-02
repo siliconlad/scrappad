@@ -8,12 +8,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .app import PygroundApp
+from scrappad.app import ScrappadApp
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="pyground",
+        prog="scrappad",
         description="Open a split-screen Python editor and live REPL.",
     )
     parser.add_argument(
@@ -29,15 +29,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if sys.platform not in {"darwin", "linux"}:
-        parser.error(
-            "Pyground currently supports macOS and Linux "
-            f"(detected platform: {sys.platform})."
-        )
+        parser.error(f"Scrappad only supports macOS and Linux (detected: {sys.platform}).")
     if args.file is not None:
-        PygroundApp(Path(args.file).expanduser().resolve()).run()
+        ScrappadApp(Path(args.file).expanduser().resolve()).run()
         return
 
-    with TemporaryDirectory(prefix="pyground-") as directory:
+    with TemporaryDirectory(prefix="scrappad-") as directory:
         scratch_path = Path(directory) / "scratch.py"
         scratch_path.touch()
-        PygroundApp(scratch_path).run()
+        ScrappadApp(scratch_path).run()

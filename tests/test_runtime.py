@@ -1,4 +1,4 @@
-from pyground.runtime import PythonRuntime, display_value
+from scrappad.runtime import PythonRuntime, display_value
 
 
 def test_sync_loads_editor_names() -> None:

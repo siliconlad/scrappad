@@ -100,7 +100,7 @@ class PythonRuntime:
 
     def _base_namespace(self) -> dict[str, Any]:
         return {
-            "__name__": "__pyground__",
+            "__name__": "__scrappad__",
             "__file__": self.filename,
             "__package__": None,
             "__builtins__": builtins.__dict__,

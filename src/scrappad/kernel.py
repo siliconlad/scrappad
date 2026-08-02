@@ -12,7 +12,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Literal
 
-from .runtime import PythonRuntime, display_value
+from scrappad.runtime import PythonRuntime, display_value
 
 ResponseState = Literal["ok", "incomplete", "error"]
 
@@ -60,7 +60,7 @@ class KernelClient:
         self._process = self._context.Process(
             target=_kernel_main,
             args=(child, self.filename),
-            name="pyground-kernel",
+            name="scrappad-kernel",
             daemon=True,
         )
         self._process.start()
@@ -87,7 +87,7 @@ class KernelClient:
         except (BrokenPipeError, EOFError, OSError):
             return KernelResponse(
                 "error",
-                error="Python worker stopped unexpectedly. Restart Pyground to continue.",
+                error="Python worker stopped unexpectedly. Restart Scrappad to continue.",
             )
         finally:
             self._request_active.clear()
@@ -130,7 +130,7 @@ class KernelClient:
             return
 
         # Windows cannot reliably deliver SIGINT to this detached worker. Stop
-        # it so the UI remains responsive; the user can restart Pyground.
+        # it so the UI remains responsive; the user can restart Scrappad.
         self._process.terminate()
 
     def close(self) -> None:

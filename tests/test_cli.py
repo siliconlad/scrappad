@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from pyground import cli
+from scrappad import cli
 
 
 def test_no_file_uses_ephemeral_system_temp_file(monkeypatch) -> None:
@@ -19,7 +19,7 @@ def test_no_file_uses_ephemeral_system_temp_file(monkeypatch) -> None:
             assert isinstance(path, Path)
             assert path.exists()
 
-    monkeypatch.setattr(cli, "PygroundApp", FakeApp)
+    monkeypatch.setattr(cli, "ScrappadApp", FakeApp)
 
     cli.main([])
 
@@ -43,7 +43,7 @@ def test_explicit_file_is_not_temporary(monkeypatch, tmp_path) -> None:
         def run(self) -> None:
             return
 
-    monkeypatch.setattr(cli, "PygroundApp", FakeApp)
+    monkeypatch.setattr(cli, "ScrappadApp", FakeApp)
 
     cli.main([str(path)])
 
@@ -56,10 +56,10 @@ def test_unsupported_platform_exits_before_starting_app(monkeypatch, capsys) -> 
             pytest.fail(f"App unexpectedly started with {path}")
 
     monkeypatch.setattr(cli.sys, "platform", "win32")
-    monkeypatch.setattr(cli, "PygroundApp", UnexpectedApp)
+    monkeypatch.setattr(cli, "ScrappadApp", UnexpectedApp)
 
     with pytest.raises(SystemExit) as exit_info:
         cli.main([])
 
     assert exit_info.value.code == 2
-    assert "currently supports macOS and Linux" in capsys.readouterr().err
+    assert "Scrappad only supports macOS and Linux" in capsys.readouterr().err

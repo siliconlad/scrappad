@@ -2,10 +2,10 @@ import asyncio
 
 from textual.widgets import Footer, RichLog, Static, TextArea
 
-from pyground.app import PygroundApp, ReplInput
+from scrappad.app import ReplInput, ScrappadApp
 
 
-async def wait_for_idle(app: PygroundApp, timeout: float = 3) -> None:
+async def wait_for_idle(app: ScrappadApp, timeout: float = 3) -> None:
     async def wait() -> None:
         while app._execution_kind is not None:
             await asyncio.sleep(0.01)
@@ -14,7 +14,7 @@ async def wait_for_idle(app: PygroundApp, timeout: float = 3) -> None:
 
 
 async def wait_for_execution(
-    app: PygroundApp,
+    app: ScrappadApp,
     kind: str,
     timeout: float = 3,
 ) -> None:
@@ -32,7 +32,7 @@ def test_split_panes_repl_history_and_save(tmp_path) -> None:
             "def greet(name):\n    return f'Hello, {name}!'\n\nanswer = 42\n",
             encoding="utf-8",
         )
-        app = PygroundApp(path)
+        app = ScrappadApp(path)
 
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
@@ -65,7 +65,7 @@ def test_split_panes_repl_history_and_save(tmp_path) -> None:
 
 def test_layout_responds_to_terminal_width(tmp_path) -> None:
     async def exercise_app() -> None:
-        app = PygroundApp(tmp_path / "responsive.py")
+        app = ScrappadApp(tmp_path / "responsive.py")
 
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
@@ -88,7 +88,7 @@ def test_editor_changes_load_only_when_entering_repl(tmp_path) -> None:
     async def exercise_app() -> None:
         path = tmp_path / "manual-sync.py"
         path.write_text("answer = 42\n", encoding="utf-8")
-        app = PygroundApp(path)
+        app = ScrappadApp(path)
 
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
@@ -136,7 +136,7 @@ def test_ctrl_c_interrupts_editor_and_allows_unchanged_retry(tmp_path) -> None:
     async def exercise_app() -> None:
         path = tmp_path / "loop.py"
         path.write_text("while True:\n    pass\n", encoding="utf-8")
-        app = PygroundApp(path)
+        app = ScrappadApp(path)
 
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
@@ -165,7 +165,7 @@ def test_ctrl_c_interrupts_editor_and_allows_unchanged_retry(tmp_path) -> None:
 
 def test_ctrl_c_interrupts_repl_without_losing_worker(tmp_path) -> None:
     async def exercise_app() -> None:
-        app = PygroundApp(tmp_path / "repl-loop.py")
+        app = ScrappadApp(tmp_path / "repl-loop.py")
 
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()
@@ -196,7 +196,7 @@ def test_ctrl_c_interrupts_repl_without_losing_worker(tmp_path) -> None:
 
 def test_new_scratchpad_is_empty_and_repl_starts_clean(tmp_path) -> None:
     async def exercise_app() -> None:
-        app = PygroundApp(tmp_path / "new.py")
+        app = ScrappadApp(tmp_path / "new.py")
 
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause()

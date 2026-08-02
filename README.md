@@ -1,13 +1,13 @@
 <div align="center">
 
-# Pyground
+# Scrappad
 
 ### Edit like a file. Explore like a REPL.
 
 A focused Python workspace for the terminal—built for the moment when a REPL
 is too cramped and a notebook is too much.
 
-[![CI](https://github.com/siliconlad/pyground/actions/workflows/ci.yml/badge.svg)](https://github.com/siliconlad/pyground/actions/workflows/ci.yml)
+[![CI](https://github.com/siliconlad/scrappad/actions/workflows/ci.yml/badge.svg)](https://github.com/siliconlad/scrappad/actions/workflows/ci.yml)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-58a6ff)
 [![MIT license](https://img.shields.io/badge/license-MIT-3fb950)](LICENSE)
@@ -16,17 +16,17 @@ is too cramped and a notebook is too much.
 
 <p align="center">
   <img
-    src="https://raw.githubusercontent.com/siliconlad/pyground/main/docs/assets/pyground-demo.svg"
-    alt="Pyground showing Python source beside a live REPL"
+    src="https://raw.githubusercontent.com/siliconlad/scrappad/main/docs/assets/scrappad-demo.svg"
+    alt="Scrappad showing Python source beside a live REPL"
     width="100%"
   >
 </p>
 
-Pyground puts a real multiline editor beside a REPL that shares its functions,
+Scrappad puts a real multiline editor beside a REPL that shares its functions,
 classes, imports, and variables. Keep reusable code tidy on the left; probe it,
 inspect it, and improvise on the right.
 
-## Why Pyground?
+## Why Scrappad?
 
 - **Code stays code.** Your experiment is an ordinary `.py` file, ready to
   keep, test, or commit.
@@ -41,20 +41,20 @@ inspect it, and improvise on the right.
 
 ## Quick start
 
-Pyground supports macOS and Linux and requires Python 3.10 or newer. Install it
+Scrappad supports macOS and Linux and requires Python 3.10 or newer. Install it
 with [`uv`](https://docs.astral.sh/uv/):
 
 ```bash
-uv tool install pyground-repl
-pyground
+uv tool install scrappad
+scrappad
 ```
 
-Running `pyground` opens an ephemeral `scratch.py` in your system temporary
+Running `scrappad` opens an ephemeral `scratch.py` in your system temporary
 directory. It disappears when the session ends. Pass a path when the work is
 worth keeping:
 
 ```bash
-pyground experiment.py
+scrappad experiment.py
 ```
 
 New named files are written to disk only when you save with `Ctrl+S`.
@@ -66,7 +66,7 @@ New named files are written to disk only when you save with `Ctrl+S`.
 3. Call functions, inspect values, and create temporary variables.
 4. Press `Ctrl+Left` to edit again, then repeat.
 
-On wide terminals the panes sit side by side. Below 100 columns, Pyground
+On wide terminals the panes sit side by side. Below 100 columns, Scrappad
 automatically stacks the editor above the REPL.
 
 ## Controls
@@ -111,10 +111,10 @@ discard REPL-only state and rebuild from the editor.
 ## Run from source
 
 ```bash
-git clone git@github.com:siliconlad/pyground.git
-cd pyground
+git clone git@github.com:siliconlad/scrappad.git
+cd scrappad
 uv sync
-uv run pyground
+uv run scrappad
 ```
 
 Run the test suite with:
@@ -125,4 +125,4 @@ uv run pytest
 
 ## License
 
-Pyground is available under the [MIT License](LICENSE).
+Scrappad is available under the [MIT License](LICENSE).
