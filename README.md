@@ -13,7 +13,8 @@ you return to the editor and fix it without losing your session.
 
 ## Install
 
-Pyground requires Python 3.10 or newer and [`uv`](https://docs.astral.sh/uv/).
+Pyground supports macOS and Linux. It requires Python 3.10 or newer and
+[`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 uv tool install pyground-repl

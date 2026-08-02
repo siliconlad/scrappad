@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,7 +26,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if sys.platform not in {"darwin", "linux"}:
+        parser.error(
+            "Pyground currently supports macOS and Linux "
+            f"(detected platform: {sys.platform})."
+        )
     if args.file is not None:
         PygroundApp(Path(args.file).expanduser().resolve()).run()
         return
