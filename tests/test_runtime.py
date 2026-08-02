@@ -117,6 +117,16 @@ def test_sync_captures_stdout() -> None:
     assert result.output == "loaded\n"
 
 
+def test_captured_output_is_bounded() -> None:
+    runtime = PythonRuntime()
+
+    result = runtime.sync("print('x' * 150_000)")
+
+    assert result.state == "ok"
+    assert len(result.output) < 101_000
+    assert "<output truncated>" in result.output
+
+
 def test_display_value_handles_broken_repr() -> None:
     class Broken:
         def __repr__(self) -> str:

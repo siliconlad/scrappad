@@ -8,9 +8,33 @@ version = "0.1.0"
 description = "A split-screen Python editor and live REPL for the terminal"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Angus Stewart", email = "siliconlad@protonmail.com" },
+]
+keywords = ["python", "repl", "terminal", "tui", "text-editor"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Interpreters",
+    "Topic :: Terminals",
+]
 dependencies = [
     "textual>=8.0,<9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/siliconlad/pyground"
+Repository = "https://github.com/siliconlad/pyground.git"
+Issues = "https://github.com/siliconlad/pyground/issues"
 
 [dependency-groups]
 dev = [

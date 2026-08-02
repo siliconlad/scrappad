@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from rich.syntax import Syntax
 from rich.table import Table
@@ -12,21 +13,11 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Input, Label, RichLog, Static, TextArea
+from textual.widgets import Input, Label, RichLog, Static, TextArea
 
-from .runtime import PythonRuntime, ReplResult, SyncResult, display_value
+from .kernel import KernelClient, KernelResponse
 
-
-STARTER = '''\
-"""Edit this code, then switch to the REPL to load your changes."""
-
-
-def greet(name: str) -> str:
-    return f"Hello, {name}!"
-
-
-answer = 42
-'''
+STARTER = ""
 
 
 class ReplInput(Input):
@@ -70,7 +61,10 @@ class PygroundApp(App[None]):
 
     TITLE = "Pyground"
     SUB_TITLE = "live Python scratchpad"
-    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (100, "-wide")]
+    HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [
+        (0, "-narrow"),
+        (100, "-wide"),
+    ]
 
     CSS = """
     Screen {
@@ -118,25 +112,45 @@ class PygroundApp(App[None]):
         height: 1fr;
         border: none;
         background: #0d1117;
+        scrollbar-size: 0 0;
     }
 
     #repl-log {
         height: 1fr;
         padding: 0 1;
         background: #0d1117;
-        scrollbar-color: #30363d;
-        scrollbar-color-hover: #58a6ff;
+        scrollbar-size: 0 0;
+    }
+
+    #repl-input-row {
+        height: 1;
+        margin: 0 1;
+        background: #0d1117;
+    }
+
+    #repl-prompt {
+        width: 4;
+        height: 1;
+        color: #58a6ff;
+        background: #0d1117;
+        text-style: bold;
+    }
+
+    #repl-input-row:focus-within #repl-prompt {
+        color: #79c0ff;
     }
 
     #repl-input {
-        height: 3;
-        margin: 0 1 1 1;
-        border: tall #30363d;
-        background: #161b22;
+        width: 1fr;
+        height: 1;
+        padding: 0;
+        border: none;
+        background: #0d1117;
     }
 
     #repl-input:focus {
-        border: tall #58a6ff;
+        border: none;
+        background: #0d1117;
     }
 
     #status {
@@ -146,9 +160,6 @@ class PygroundApp(App[None]):
         color: #8b949e;
     }
 
-    Footer {
-        background: #010409;
-    }
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -156,6 +167,7 @@ class PygroundApp(App[None]):
         Binding("ctrl+left,ctrl+up", "focus_editor", "Editor", priority=True),
         Binding("ctrl+right,ctrl+down", "focus_repl", "REPL", priority=True),
         Binding("f5", "sync", "Run editor", priority=True),
+        Binding("ctrl+c", "interrupt", "Interrupt", priority=True, show=False),
         Binding("ctrl+s", "save", "Save", priority=True),
         Binding("ctrl+l", "clear_repl", "Clear REPL", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
@@ -164,22 +176,28 @@ class PygroundApp(App[None]):
     def __init__(self, path: Path) -> None:
         super().__init__()
         self.path = path
-        self.runtime = PythonRuntime(path)
+        self.kernel = KernelClient(path)
         self.source = path.read_text(encoding="utf-8") if path.exists() else STARTER
         self._last_error = ""
         self._dirty = False
-        self._needs_sync = True
+        self._needs_sync = bool(self.source)
         self._edit_revision = 0
-        self._last_attempted_revision = -1
+        self._symbol_count = 0
+        self._active_pane: Literal["editor", "repl"] = "editor"
+        self._execution_kind: Literal["editor", "repl"] | None = None
+        self._execution_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="workspace"):
             with Vertical(classes="pane", id="editor-pane"):
-                yield Label(f"EDITOR  {self.path}", classes="pane-title", id="editor-title")
+                yield Label(
+                    f"EDITOR  {self.path}", classes="pane-title", id="editor-title"
+                )
                 yield TextArea(
                     self.source,
                     language="python",
                     show_line_numbers=True,
+                    soft_wrap=True,
                     tab_behavior="indent",
                     id="editor",
                 )
@@ -192,19 +210,25 @@ class PygroundApp(App[None]):
                     wrap=True,
                     max_lines=2_000,
                 )
-                yield ReplInput(
-                    id="repl-input",
-                    placeholder=">>> Try: greet('Ada')   (:help for commands)",
-                )
+                with Horizontal(id="repl-input-row"):
+                    yield Static(">>>", id="repl-prompt")
+                    yield ReplInput(
+                        id="repl-input",
+                        placeholder="expression or :help",
+                    )
         yield Static("Starting…", id="status")
-        yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#editor", TextArea).focus()
-        log = self.query_one("#repl-log", RichLog)
-        log.write(Text("Pyground REPL", style="bold #58a6ff"))
-        log.write("Switch to the REPL to load editor changes. Type :help for commands.")
-        self._perform_sync(announce=True)
+        if self._needs_sync:
+            self._show_pending_status()
+        else:
+            self._show_ready_status()
+
+    def on_unmount(self) -> None:
+        if self._execution_task is not None:
+            self._execution_task.cancel()
+        self.kernel.close()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "editor":
@@ -213,44 +237,91 @@ class PygroundApp(App[None]):
         self._needs_sync = True
         self._edit_revision += 1
         self._update_editor_title()
-        status = self.query_one("#status", Static)
-        status.update("● Changes pending — switch to the REPL to load them")
-        status.styles.color = "#d29922"
+        self._show_pending_status()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
-        if event.widget.id in {"repl-input", "repl-log"}:
+        if event.widget.id == "editor":
+            self._active_pane = "editor"
+        elif (
+            event.widget.id in {"repl-input", "repl-log"}
+            and self._active_pane != "repl"
+        ):
+            self._active_pane = "repl"
             self._sync_if_needed()
 
     def _sync_if_needed(self) -> None:
-        if (
-            self._needs_sync
-            and self._last_attempted_revision != self._edit_revision
-        ):
-            self._perform_sync()
+        if self._needs_sync:
+            self._start_editor_sync()
 
-    def _perform_sync(self, announce: bool = False) -> None:
-        self._last_attempted_revision = self._edit_revision
+    def _start_editor_sync(self, *, force: bool = False, reset: bool = False) -> None:
+        if self._execution_kind is not None:
+            self.notify("Python is already running. Press Ctrl+C to interrupt it.")
+            return
+        if not force and not self._needs_sync:
+            return
+
+        revision = self._edit_revision
         source = self.query_one("#editor", TextArea).text
-        result = self.runtime.sync(source)
-        self._show_sync_result(result, announce)
+        self._execution_kind = "editor"
+        status = self.query_one("#status", Static)
+        status.update("● Running editor… Ctrl+C to interrupt")
+        status.styles.color = "#58a6ff"
+        self._execution_task = asyncio.create_task(
+            self._finish_editor_sync(source, revision, reset=reset)
+        )
 
-    def _show_sync_result(self, result: SyncResult, announce: bool = False) -> None:
+    async def _finish_editor_sync(
+        self,
+        source: str,
+        revision: int,
+        *,
+        reset: bool,
+    ) -> None:
+        try:
+            response = (
+                await self.kernel.reset(source)
+                if reset
+                else await self.kernel.sync(source)
+            )
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._execution_kind = None
+            self._execution_task = None
+
+        if not self.is_mounted:
+            return
+        self._show_sync_result(response, revision)
+        if reset and response.state == "ok":
+            self.query_one("#repl-log", RichLog).write(
+                "REPL-only names were discarded."
+            )
+
+    def _show_sync_result(self, result: KernelResponse, revision: int) -> None:
         status = self.query_one("#status", Static)
         log = self.query_one("#repl-log", RichLog)
+        self._symbol_count = result.symbol_count
         if result.output:
             log.write(Text("editor output", style="bold #d29922"))
             log.write(result.output.rstrip("\n"))
 
+        if result.interrupted:
+            status.update("● Interrupted — switch to the REPL or press F5 to retry")
+            status.styles.color = "#d29922"
+            self.query_one("#editor", TextArea).focus()
+            return
+
         if result.state == "ok":
-            self._needs_sync = False
-            count = len(self.runtime.visible_names)
-            status.update(f"● Synced  {count} names available  |  {self.path.name}")
-            status.styles.color = "#3fb950"
+            if revision == self._edit_revision:
+                self._needs_sync = False
+                self._show_ready_status()
+            else:
+                self._show_pending_status()
             self._last_error = ""
-            if announce:
-                log.write(Text(f"Loaded {count} names from the editor.", style="#3fb950"))
         elif result.state == "incomplete":
-            status.update("● Incomplete Python — last working namespace is still active")
+            status.update(
+                "● Incomplete Python — last working namespace is still active"
+            )
             status.styles.color = "#d29922"
         else:
             status.update("● Editor error — last working namespace is still active")
@@ -260,8 +331,23 @@ class PygroundApp(App[None]):
                 log.write(result.error)
                 self._last_error = result.error
 
+    def _show_pending_status(self) -> None:
+        status = self.query_one("#status", Static)
+        status.update("● Changes pending — switch to the REPL to load them")
+        status.styles.color = "#d29922"
+
+    def _show_ready_status(self) -> None:
+        status = self.query_one("#status", Static)
+        status.update(
+            f"● Synced  {self._symbol_count} symbols available  |  {self.path.name}"
+        )
+        status.styles.color = "#3fb950"
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "repl-input":
+            return
+        if self._execution_kind is not None:
+            self.notify("Python is still running. Press Ctrl+C to interrupt it.")
             return
         command = event.value.strip()
         repl_input = self.query_one("#repl-input", ReplInput)
@@ -277,17 +363,41 @@ class PygroundApp(App[None]):
         if command.startswith(":"):
             self._handle_command(command)
         else:
-            self._show_repl_result(self.runtime.execute(command))
+            self._start_repl_execution(command)
 
-    def _show_repl_result(self, result: ReplResult) -> None:
+    def _start_repl_execution(self, command: str) -> None:
+        self._execution_kind = "repl"
+        status = self.query_one("#status", Static)
+        status.update("● Running REPL… Ctrl+C to interrupt")
+        status.styles.color = "#58a6ff"
+        self._execution_task = asyncio.create_task(self._finish_repl_execution(command))
+
+    async def _finish_repl_execution(self, command: str) -> None:
+        try:
+            result = await self.kernel.execute(command)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._execution_kind = None
+            self._execution_task = None
+
+        if not self.is_mounted:
+            return
+        self._show_repl_result(result)
+
+    def _show_repl_result(self, result: KernelResponse) -> None:
         log = self.query_one("#repl-log", RichLog)
+        self._symbol_count = result.symbol_count
         if result.output:
             log.write(result.output.rstrip("\n"))
-        if result.has_value:
-            rendered = display_value(result.value)
-            log.write(Syntax(rendered, "python", word_wrap=True))
+        if result.has_display:
+            log.write(Syntax(result.display, "python", word_wrap=True))
         if result.error:
             log.write(Text(result.error, style="#f85149"))
+        if self._needs_sync:
+            self._show_pending_status()
+        else:
+            self._show_ready_status()
 
     def _handle_command(self, command: str) -> None:
         log = self.query_one("#repl-log", RichLog)
@@ -301,34 +411,60 @@ class PygroundApp(App[None]):
                 ":help   show this help"
             )
         elif name == ":vars":
-            table = Table("name", "type", "value", box=None, header_style="bold #58a6ff")
-            for item_name, value in sorted(self.runtime.visible_names.items()):
-                table.add_row(
-                    Text(item_name),
-                    Text(type(value).__name__),
-                    Text(display_value(value, 120)),
-                )
-            if table.row_count:
-                log.write(table)
-            else:
-                log.write("No names are currently defined.")
+            self._start_variable_inspection()
         elif name == ":sync":
-            self._perform_sync(announce=True)
+            self._start_editor_sync(force=True)
         elif name == ":reset":
-            result = self.runtime.reset(self.query_one("#editor", TextArea).text)
-            self._show_sync_result(result, announce=True)
-            if result.state == "ok":
-                log.write("REPL-only names were discarded.")
+            self._start_editor_sync(force=True, reset=True)
         elif name == ":clear":
             log.clear()
         else:
             log.write(Text(f"Unknown command: {name}. Try :help", style="#f85149"))
 
+    def _start_variable_inspection(self) -> None:
+        self._execution_kind = "repl"
+        status = self.query_one("#status", Static)
+        status.update("● Inspecting variables… Ctrl+C to interrupt")
+        status.styles.color = "#58a6ff"
+        self._execution_task = asyncio.create_task(self._finish_variable_inspection())
+
+    async def _finish_variable_inspection(self) -> None:
+        try:
+            result = await self.kernel.variables()
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._execution_kind = None
+            self._execution_task = None
+
+        if not self.is_mounted:
+            return
+        log = self.query_one("#repl-log", RichLog)
+        self._symbol_count = result.symbol_count
+        if result.interrupted or result.error:
+            log.write(Text(result.error or "KeyboardInterrupt", style="#f85149"))
+        elif result.variables:
+            table = Table(
+                "name", "type", "value", box=None, header_style="bold #58a6ff"
+            )
+            for variable in result.variables:
+                table.add_row(
+                    Text(variable.name),
+                    Text(variable.type_name),
+                    Text(variable.value),
+                )
+            log.write(table)
+        else:
+            log.write("No names are currently defined.")
+        if self._needs_sync:
+            self._show_pending_status()
+        else:
+            self._show_ready_status()
+
     def action_switch_pane(self) -> None:
         editor = self.query_one("#editor", TextArea)
         repl_input = self.query_one("#repl-input", ReplInput)
         if editor.has_focus:
-            self._sync_if_needed()
             repl_input.focus()
         else:
             editor.focus()
@@ -337,16 +473,33 @@ class PygroundApp(App[None]):
         self.query_one("#editor", TextArea).focus()
 
     def action_focus_repl(self) -> None:
-        self._sync_if_needed()
         self.query_one("#repl-input", ReplInput).focus()
 
     def action_sync(self) -> None:
-        self._perform_sync(announce=True)
+        self._start_editor_sync(force=True)
+
+    def action_interrupt(self) -> None:
+        if self._execution_kind is None:
+            focused = self.focused
+            copy_action = getattr(focused, "action_copy", None)
+            if callable(copy_action):
+                copy_action()
+            return
+
+        execution_kind = self._execution_kind
+        if self.kernel.interrupt():
+            status = self.query_one("#status", Static)
+            status.update("● Interrupting Python…")
+            status.styles.color = "#d29922"
+            if execution_kind == "editor":
+                self.query_one("#editor", TextArea).focus()
 
     def action_save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(self.query_one("#editor", TextArea).text, encoding="utf-8")
+            self.path.write_text(
+                self.query_one("#editor", TextArea).text, encoding="utf-8"
+            )
         except OSError as exc:
             self.notify(f"Could not save: {exc}", severity="error")
             return

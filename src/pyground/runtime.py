@@ -18,7 +18,6 @@ from pathlib import Path
 from types import CodeType
 from typing import Any, Literal
 
-
 SyncState = Literal["ok", "incomplete", "error"]
 
 
@@ -27,6 +26,7 @@ class SyncResult:
     state: SyncState
     output: str = ""
     error: str = ""
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,31 @@ class ReplResult:
     value: Any = None
     has_value: bool = False
     error: str = ""
+    interrupted: bool = False
+
+
+class _BoundedOutput(io.StringIO):
+    """Capture user output without allowing an infinite print loop to exhaust RAM."""
+
+    def __init__(self, limit: int = 100_000) -> None:
+        super().__init__()
+        self.limit = limit
+        self.truncated = False
+
+    def write(self, text: str) -> int:
+        original_length = len(text)
+        remaining = self.limit - self.tell()
+        if remaining > 0:
+            super().write(text[:remaining])
+        if original_length > max(remaining, 0):
+            self.truncated = True
+        return original_length
+
+    def getvalue(self) -> str:
+        value = super().getvalue()
+        if self.truncated:
+            value += "\n... <output truncated>\n"
+        return value
 
 
 def _format_exception() -> str:
@@ -49,7 +74,9 @@ def display_value(value: Any, limit: int = 12_000) -> str:
 
     try:
         rendered = repr(value)
-    except BaseException as exc:  # repr is user code and is allowed to fail
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - repr is arbitrary user code
         rendered = f"<repr failed: {type(exc).__name__}: {exc}>"
     if len(rendered) > limit:
         return rendered[:limit] + f"\n... <{len(rendered) - limit} characters omitted>"
@@ -115,12 +142,20 @@ class PythonRuntime:
             if name not in self._editor_names and not name.startswith("__")
         )
         before = dict(candidate)
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        stdout = _BoundedOutput()
+        stderr = _BoundedOutput()
         try:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                exec(code, candidate, candidate)
-        except BaseException:
+                exec(code, candidate, candidate)  # noqa: S102 - this is a Python REPL
+        except KeyboardInterrupt:
+            output = stdout.getvalue() + stderr.getvalue()
+            return SyncResult(
+                "error",
+                output=output,
+                error="KeyboardInterrupt",
+                interrupted=True,
+            )
+        except BaseException:  # noqa: BLE001 - report user exceptions in the REPL
             output = stdout.getvalue() + stderr.getvalue()
             return SyncResult("error", output=output, error=_format_exception())
 
@@ -153,8 +188,8 @@ class PythonRuntime:
     def execute(self, command: str) -> ReplResult:
         """Execute one REPL command, displaying the final expression if present."""
 
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        stdout = _BoundedOutput()
+        stderr = _BoundedOutput()
         try:
             module = ast.parse(command, self.filename, mode="exec")
             expression: ast.expr | None = None
@@ -165,7 +200,11 @@ class PythonRuntime:
             has_value = False
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 if module.body:
-                    exec(compile(module, self.filename, "exec"), self.namespace, self.namespace)
+                    exec(  # noqa: S102 - this is a Python REPL
+                        compile(module, self.filename, "exec"),
+                        self.namespace,
+                        self.namespace,
+                    )
                 if expression is not None:
                     value = eval(
                         compile(ast.Expression(expression), self.filename, "eval"),
@@ -178,7 +217,13 @@ class PythonRuntime:
                 value=value,
                 has_value=has_value,
             )
-        except BaseException:
+        except KeyboardInterrupt:
+            return ReplResult(
+                output=stdout.getvalue() + stderr.getvalue(),
+                error="KeyboardInterrupt",
+                interrupted=True,
+            )
+        except BaseException:  # noqa: BLE001 - report user exceptions in the REPL
             return ReplResult(
                 output=stdout.getvalue() + stderr.getvalue(),
                 error=_format_exception(),
