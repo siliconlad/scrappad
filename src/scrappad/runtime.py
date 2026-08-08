@@ -126,7 +126,11 @@ class PythonRuntime:
             return None, SyncResult("incomplete")
         return maybe_code, None
 
-    def sync(self, source: str) -> SyncResult:
+    def sync(
+        self,
+        source: str,
+        output_stream: io.TextIOBase | None = None,
+    ) -> SyncResult:
         """Execute editor source and atomically publish it on success."""
 
         code, early_result = self._compile_editor(source)
@@ -142,22 +146,35 @@ class PythonRuntime:
             if name not in self._editor_names and not name.startswith("__")
         )
         before = dict(candidate)
-        stdout = _BoundedOutput()
-        stderr = _BoundedOutput()
+        capture_output = output_stream is None
+        stdout = _BoundedOutput() if capture_output else output_stream
+        stderr = _BoundedOutput() if capture_output else output_stream
+        assert stdout is not None
+        assert stderr is not None
+
+        def captured_output() -> str:
+            if not capture_output:
+                return ""
+            assert isinstance(stdout, _BoundedOutput)
+            assert isinstance(stderr, _BoundedOutput)
+            return stdout.getvalue() + stderr.getvalue()
+
         try:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 exec(code, candidate, candidate)  # noqa: S102 - this is a Python REPL
         except KeyboardInterrupt:
-            output = stdout.getvalue() + stderr.getvalue()
             return SyncResult(
                 "error",
-                output=output,
+                output=captured_output(),
                 error="KeyboardInterrupt",
                 interrupted=True,
             )
         except BaseException:  # noqa: BLE001 - report user exceptions in the REPL
-            output = stdout.getvalue() + stderr.getvalue()
-            return SyncResult("error", output=output, error=_format_exception())
+            return SyncResult(
+                "error",
+                output=captured_output(),
+                error=_format_exception(),
+            )
 
         statically_bound = _top_level_bound_names(source)
         changed_or_new = {
@@ -169,9 +186,13 @@ class PythonRuntime:
         self._editor_names = statically_bound | changed_or_new
         self.namespace = candidate
         self.last_source = source
-        return SyncResult("ok", output=stdout.getvalue() + stderr.getvalue())
+        return SyncResult("ok", output=captured_output())
 
-    def reset(self, source: str | None = None) -> SyncResult:
+    def reset(
+        self,
+        source: str | None = None,
+        output_stream: io.TextIOBase | None = None,
+    ) -> SyncResult:
         """Discard REPL scratch names and rebuild from the editor."""
 
         source = self.last_source if source is None else source
@@ -179,17 +200,32 @@ class PythonRuntime:
         previous_editor_names = self._editor_names
         self.namespace = self._base_namespace()
         self._editor_names.clear()
-        result = self.sync(source)
+        result = self.sync(source, output_stream=output_stream)
         if result.state != "ok":
             self.namespace = previous_namespace
             self._editor_names = previous_editor_names
         return result
 
-    def execute(self, command: str) -> ReplResult:
+    def execute(
+        self,
+        command: str,
+        output_stream: io.TextIOBase | None = None,
+    ) -> ReplResult:
         """Execute one REPL command, displaying the final expression if present."""
 
-        stdout = _BoundedOutput()
-        stderr = _BoundedOutput()
+        capture_output = output_stream is None
+        stdout = _BoundedOutput() if capture_output else output_stream
+        stderr = _BoundedOutput() if capture_output else output_stream
+        assert stdout is not None
+        assert stderr is not None
+
+        def captured_output() -> str:
+            if not capture_output:
+                return ""
+            assert isinstance(stdout, _BoundedOutput)
+            assert isinstance(stderr, _BoundedOutput)
+            return stdout.getvalue() + stderr.getvalue()
+
         try:
             module = ast.parse(command, self.filename, mode="exec")
             expression: ast.expr | None = None
@@ -213,19 +249,19 @@ class PythonRuntime:
                     )
                     has_value = value is not None
             return ReplResult(
-                output=stdout.getvalue() + stderr.getvalue(),
+                output=captured_output(),
                 value=value,
                 has_value=has_value,
             )
         except KeyboardInterrupt:
             return ReplResult(
-                output=stdout.getvalue() + stderr.getvalue(),
+                output=captured_output(),
                 error="KeyboardInterrupt",
                 interrupted=True,
             )
         except BaseException:  # noqa: BLE001 - report user exceptions in the REPL
             return ReplResult(
-                output=stdout.getvalue() + stderr.getvalue(),
+                output=captured_output(),
                 error=_format_exception(),
             )
 

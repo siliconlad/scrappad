@@ -1,3 +1,5 @@
+import io
+
 from scrappad.runtime import PythonRuntime, display_value
 
 
@@ -40,6 +42,16 @@ def test_repl_evaluates_final_expression_and_captures_output() -> None:
     assert result.output == "hello\n"
     assert result.has_value is True
     assert result.value == 42
+
+
+def test_repl_can_stream_output_without_recapturing_it() -> None:
+    runtime = PythonRuntime()
+    output = io.StringIO()
+
+    result = runtime.execute("print('hello')", output_stream=output)
+
+    assert output.getvalue() == "hello\n"
+    assert result.output == ""
 
 
 def test_repl_scratch_names_survive_editor_refresh() -> None:
@@ -115,6 +127,17 @@ def test_sync_captures_stdout() -> None:
 
     assert result.state == "ok"
     assert result.output == "loaded\n"
+
+
+def test_sync_can_stream_output_without_recapturing_it() -> None:
+    runtime = PythonRuntime()
+    output = io.StringIO()
+
+    result = runtime.sync("print('loaded')", output_stream=output)
+
+    assert result.state == "ok"
+    assert output.getvalue() == "loaded\n"
+    assert result.output == ""
 
 
 def test_captured_output_is_bounded() -> None:

@@ -13,21 +13,22 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Input, Label, RichLog, Static, TextArea
+from textual.widgets import Input, RichLog, Static, TextArea
 
 from scrappad.kernel import KernelClient, KernelResponse
 
-STARTER = ""
+STARTER_TEXT = ""
 
 
 class ReplInput(Input):
     """A one-line input with shell-style command history."""
 
-    def __init__(self, **kwargs: object) -> None:
+    def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.history: list[str] = []
         self.history_index = 0
         self._draft = ""
+        self.busy = False
 
     def remember(self, command: str) -> None:
         if not self.history or self.history[-1] != command:
@@ -36,7 +37,10 @@ class ReplInput(Input):
         self._draft = ""
 
     def on_key(self, event: events.Key) -> None:
-        if event.key == "up" and self.history:
+        if self.busy:
+            event.prevent_default()
+            event.stop()
+        elif event.key == "up" and self.history:
             if self.history_index == len(self.history):
                 self._draft = self.value
             self.history_index = max(0, self.history_index - 1)
@@ -59,21 +63,25 @@ class ReplInput(Input):
 class ScrappadApp(App[None]):
     """Split-screen Python editor with a synchronized REPL."""
 
-    TITLE = "Scrappad"
+    TITLE = "scrappad"
     SUB_TITLE = "live Python scratchpad"
-    HORIZONTAL_BREAKPOINTS: ClassVar[list[tuple[int, str]]] = [
+    HORIZONTAL_BREAKPOINTS = [
         (0, "-narrow"),
         (100, "-wide"),
     ]
 
     CSS = """
     Screen {
+        margin: 0;
+        padding: 0;
         background: #0d1117;
         color: #d8dee9;
     }
 
     #workspace {
         height: 1fr;
+        margin: 0;
+        padding: 0;
     }
 
     Screen.-wide #workspace {
@@ -100,14 +108,6 @@ class ScrappadApp(App[None]):
         border: round #58a6ff;
     }
 
-    .pane-title {
-        height: 1;
-        padding: 0 1;
-        background: #161b22;
-        color: #8b949e;
-        text-style: bold;
-    }
-
     #editor {
         height: 1fr;
         border: none;
@@ -116,10 +116,15 @@ class ScrappadApp(App[None]):
     }
 
     #repl-log {
-        height: 1fr;
+        height: auto;
+        max-height: 1fr;
         padding: 0 1;
         background: #0d1117;
         scrollbar-size: 0 0;
+    }
+
+    #repl-log:focus {
+        background-tint: transparent;
     }
 
     #repl-input-row {
@@ -151,13 +156,36 @@ class ScrappadApp(App[None]):
     #repl-input:focus {
         border: none;
         background: #0d1117;
+        background-tint: transparent;
     }
 
-    #status {
+    #bottom-bar {
+        height: 1;
+        margin: 0;
+        padding: 0;
+    }
+
+    .bar-item {
         height: 1;
         padding: 0 1;
         background: #161b22;
+    }
+
+    #editor-status,
+    #repl-status {
+        width: 1fr;
         color: #8b949e;
+    }
+
+    #file-path {
+        width: auto;
+        max-width: 50%;
+        color: #8b949e;
+        text-align: center;
+    }
+
+    #repl-status {
+        text-align: right;
     }
 
     """
@@ -177,32 +205,31 @@ class ScrappadApp(App[None]):
         super().__init__()
         self.path = path
         self.kernel = KernelClient(path)
-        self.source = path.read_text(encoding="utf-8") if path.exists() else STARTER
+        self.source = path.read_text(encoding="utf-8") if path.exists() else STARTER_TEXT
+
         self._last_error = ""
-        self._dirty = False
-        self._needs_sync = bool(self.source)
-        self._edit_revision = 0
+        self._synced_source = STARTER_TEXT
+        self._needs_sync = self.source != self._synced_source
         self._symbol_count = 0
+
         self._active_pane: Literal["editor", "repl"] = "editor"
         self._execution_kind: Literal["editor", "repl"] | None = None
         self._execution_task: asyncio.Task[None] | None = None
+        self._restore_repl_focus = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="workspace"):
             with Vertical(classes="pane", id="editor-pane"):
-                yield Label(
-                    f"EDITOR  {self.path}", classes="pane-title", id="editor-title"
-                )
                 yield TextArea(
                     self.source,
                     language="python",
                     show_line_numbers=True,
                     soft_wrap=True,
                     tab_behavior="indent",
+                    highlight_cursor_line=False,
                     id="editor",
                 )
             with Vertical(classes="pane", id="repl-pane"):
-                yield Label("REPL  shared namespace", classes="pane-title")
                 yield RichLog(
                     id="repl-log",
                     highlight=True,
@@ -216,38 +243,91 @@ class ScrappadApp(App[None]):
                         id="repl-input",
                         placeholder="expression or :help",
                     )
-        yield Static("Starting…", id="status")
+        with Horizontal(id="bottom-bar"):
+            yield Static(classes="bar-item", id="editor-status")
+            yield Static(
+                str(self.path.resolve()),
+                classes="bar-item",
+                id="file-path",
+            )
+            yield Static(classes="bar-item", id="repl-status")
 
     def on_mount(self) -> None:
         self.query_one("#editor", TextArea).focus()
+        self.call_after_refresh(self._fit_repl_log)
         if self._needs_sync:
-            self._show_pending_status()
+            self._show_editor_pending_status()
         else:
-            self._show_ready_status()
+            self._show_editor_no_changes_status()
+        self._show_repl_ready_status()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.call_after_refresh(self._fit_repl_log)
 
     def on_unmount(self) -> None:
-        if self._execution_task is not None:
-            self._execution_task.cancel()
+        execution_task = self._execution_task
+        self._execution_task = None
+        self._execution_kind = None
+        if execution_task is not None:
+            execution_task.cancel()
         self.kernel.close()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "editor":
             return
-        self._dirty = True
-        self._needs_sync = True
-        self._edit_revision += 1
-        self._update_editor_title()
-        self._show_pending_status()
+        was_pending = self._needs_sync
+        self._needs_sync = event.text_area.text != self._synced_source
+        if self._needs_sync:
+            self._show_editor_pending_status()
+        elif was_pending:
+            self._show_editor_no_changes_status()
+        else:
+            self._show_editor_state_status()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         if event.widget.id == "editor":
-            self._active_pane = "editor"
+            if self._active_pane != "editor":
+                self._active_pane = "editor"
+                if self._execution_kind is not None:
+                    self._show_execution_status()
         elif (
             event.widget.id in {"repl-input", "repl-log"}
             and self._active_pane != "repl"
         ):
             self._active_pane = "repl"
-            self._sync_if_needed()
+            if self._execution_kind is not None:
+                self._show_execution_status()
+            else:
+                self._sync_if_needed()
+
+    def on_click(self, event: events.Click) -> None:
+        if event.widget is not None and event.widget.id == "repl-pane":
+            self.query_one("#repl-input", ReplInput).focus()
+
+    def _show_repl_waiting(self) -> None:
+        repl_input = self.query_one("#repl-input", ReplInput)
+        self._restore_repl_focus = repl_input.has_focus
+        repl_input.busy = True
+        repl_input.placeholder = ""
+        self.query_one("#repl-prompt", Static).display = False
+
+    def _show_repl_ready(self, *, restore_focus: bool = True) -> None:
+        repl_input = self.query_one("#repl-input", ReplInput)
+        repl_input.busy = False
+        repl_input.placeholder = "expression or :help"
+        self.query_one("#repl-prompt", Static).display = True
+        if restore_focus and self._restore_repl_focus:
+            repl_input.focus()
+        self._restore_repl_focus = False
+
+    def _fit_repl_log(self) -> None:
+        repl_pane = self.query_one("#repl-pane")
+        input_row = self.query_one("#repl-input-row")
+        available_height = max(
+            0,
+            repl_pane.content_region.height - input_row.outer_size.height,
+        )
+        self.query_one("#repl-log", RichLog).styles.max_height = available_height
 
     def _sync_if_needed(self) -> None:
         if self._needs_sync:
@@ -255,33 +335,41 @@ class ScrappadApp(App[None]):
 
     def _start_editor_sync(self, *, force: bool = False, reset: bool = False) -> None:
         if self._execution_kind is not None:
-            self.notify("Python is already running. Press Ctrl+C to interrupt it.")
+            self._show_python_busy_status()
             return
         if not force and not self._needs_sync:
             return
 
-        revision = self._edit_revision
         source = self.query_one("#editor", TextArea).text
         self._execution_kind = "editor"
-        status = self.query_one("#status", Static)
-        status.update("● Running editor… Ctrl+C to interrupt")
-        status.styles.color = "#58a6ff"
+        self._show_repl_waiting()
+        self._show_repl_editor_running_status()
         self._execution_task = asyncio.create_task(
-            self._finish_editor_sync(source, revision, reset=reset)
+            self._finish_editor_sync(source, reset=reset)
         )
 
     async def _finish_editor_sync(
         self,
         source: str,
-        revision: int,
         *,
         reset: bool,
     ) -> None:
+        first_output = True
+
+        def write_output(output: str) -> None:
+            nonlocal first_output
+            self.call_from_thread(
+                self._write_editor_output,
+                output,
+                first_output,
+            )
+            first_output = False
+
         try:
             response = (
-                await self.kernel.reset(source)
+                await self.kernel.reset(source, on_output=write_output)
                 if reset
-                else await self.kernel.sync(source)
+                else await self.kernel.sync(source, on_output=write_output)
             )
         except asyncio.CancelledError:
             return
@@ -291,14 +379,14 @@ class ScrappadApp(App[None]):
 
         if not self.is_mounted:
             return
-        self._show_sync_result(response, revision)
+        self._show_sync_result(response, source)
         if reset and response.state == "ok":
             self.query_one("#repl-log", RichLog).write(
                 "REPL-only names were discarded."
             )
+        self._show_repl_ready(restore_focus=not response.interrupted)
 
-    def _show_sync_result(self, result: KernelResponse, revision: int) -> None:
-        status = self.query_one("#status", Static)
+    def _show_sync_result(self, result: KernelResponse, source: str) -> None:
         log = self.query_one("#repl-log", RichLog)
         self._symbol_count = result.symbol_count
         if result.output:
@@ -306,48 +394,94 @@ class ScrappadApp(App[None]):
             log.write(result.output.rstrip("\n"))
 
         if result.interrupted:
-            status.update("● Interrupted — switch to the REPL or press F5 to retry")
-            status.styles.color = "#d29922"
+            self._set_repl_status(
+                "Editor interrupted - sync to retry",
+                "#d29922",
+            )
+            self._show_editor_state_status()
             self.query_one("#editor", TextArea).focus()
             return
 
         if result.state == "ok":
-            if revision == self._edit_revision:
-                self._needs_sync = False
-                self._show_ready_status()
+            self._synced_source = source
+            editor_source = self.query_one("#editor", TextArea).text
+            self._needs_sync = editor_source != self._synced_source
+            if self._needs_sync:
+                self._show_editor_pending_status()
             else:
-                self._show_pending_status()
+                self._show_editor_synced_status()
+            self._show_repl_ready_status()
             self._last_error = ""
         elif result.state == "incomplete":
-            status.update(
-                "● Incomplete Python — last working namespace is still active"
+            self._show_editor_state_status()
+            self._set_repl_status(
+                "Incomplete Python — last working namespace is still active",
+                "#d29922",
             )
-            status.styles.color = "#d29922"
         else:
-            status.update("● Editor error — last working namespace is still active")
-            status.styles.color = "#f85149"
+            self._show_editor_state_status()
+            self._set_repl_status(
+                "Editor error — last working namespace is still active",
+                "#f85149",
+            )
             if result.error and result.error != self._last_error:
                 log.write(Text("editor error", style="bold #f85149"))
                 log.write(result.error)
                 self._last_error = result.error
 
-    def _show_pending_status(self) -> None:
-        status = self.query_one("#status", Static)
-        status.update("● Changes pending — switch to the REPL to load them")
-        status.styles.color = "#d29922"
+    def _show_editor_pending_status(self) -> None:
+        self._set_editor_status("Changes pending - sync to load them", "#d29922")
 
-    def _show_ready_status(self) -> None:
-        status = self.query_one("#status", Static)
-        status.update(
-            f"● Synced  {self._symbol_count} symbols available  |  {self.path.name}"
+    def _show_editor_synced_status(self) -> None:
+        self._set_editor_status("Synced", "#3fb950")
+
+    def _show_editor_no_changes_status(self) -> None:
+        self._set_editor_status("No changes to sync", "#3fb950")
+
+    def _show_editor_state_status(self) -> None:
+        if self._needs_sync:
+            self._show_editor_pending_status()
+        else:
+            self._show_editor_no_changes_status()
+
+    def _set_editor_status(self, message: str, color: str) -> None:
+        status = self.query_one("#editor-status", Static)
+        status.update(f"●  {message}")
+        status.styles.color = color
+
+    def _set_repl_status(self, message: str, color: str) -> None:
+        status = self.query_one("#repl-status", Static)
+        status.update(f"{message}  ●")
+        status.styles.color = color
+
+    def _show_repl_ready_status(self) -> None:
+        self._set_repl_status(
+            f"Ready — {self._symbol_count} symbols available", "#3fb950"
         )
-        status.styles.color = "#3fb950"
+
+    def _show_python_busy_status(self) -> None:
+        self._set_repl_status(
+            "Python is already running — Ctrl+C to interrupt",
+            "#d29922",
+        )
+
+    def _show_repl_editor_running_status(self) -> None:
+        self._set_repl_status("Running editor… Ctrl+C to interrupt", "#58a6ff")
+
+    def _show_repl_running_status(self) -> None:
+        self._set_repl_status("Running REPL… Ctrl+C to interrupt", "#58a6ff")
+
+    def _show_execution_status(self) -> None:
+        if self._execution_kind == "editor":
+            self._show_repl_editor_running_status()
+        elif self._execution_kind == "repl":
+            self._show_repl_running_status()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "repl-input":
             return
         if self._execution_kind is not None:
-            self.notify("Python is still running. Press Ctrl+C to interrupt it.")
+            self._show_python_busy_status()
             return
         command = event.value.strip()
         repl_input = self.query_one("#repl-input", ReplInput)
@@ -367,14 +501,16 @@ class ScrappadApp(App[None]):
 
     def _start_repl_execution(self, command: str) -> None:
         self._execution_kind = "repl"
-        status = self.query_one("#status", Static)
-        status.update("● Running REPL… Ctrl+C to interrupt")
-        status.styles.color = "#58a6ff"
+        self._show_repl_waiting()
+        self._show_repl_running_status()
         self._execution_task = asyncio.create_task(self._finish_repl_execution(command))
 
     async def _finish_repl_execution(self, command: str) -> None:
+        def write_output(output: str) -> None:
+            self.call_from_thread(self._write_repl_output, output)
+
         try:
-            result = await self.kernel.execute(command)
+            result = await self.kernel.execute(command, on_output=write_output)
         except asyncio.CancelledError:
             return
         finally:
@@ -384,6 +520,19 @@ class ScrappadApp(App[None]):
         if not self.is_mounted:
             return
         self._show_repl_result(result)
+        self._show_repl_ready()
+
+    def _write_editor_output(self, output: str, include_header: bool) -> None:
+        if include_header:
+            self.query_one("#repl-log", RichLog).write(
+                Text("editor output", style="bold #d29922")
+            )
+        self._write_repl_output(output)
+
+    def _write_repl_output(self, output: str) -> None:
+        rendered = output.rstrip("\n")
+        if rendered:
+            self.query_one("#repl-log", RichLog).write(rendered)
 
     def _show_repl_result(self, result: KernelResponse) -> None:
         log = self.query_one("#repl-log", RichLog)
@@ -391,13 +540,17 @@ class ScrappadApp(App[None]):
         if result.output:
             log.write(result.output.rstrip("\n"))
         if result.has_display:
-            log.write(Syntax(result.display, "python", word_wrap=True))
+            log.write(
+                Syntax(
+                    result.display,
+                    "python",
+                    word_wrap=True,
+                    background_color="default",
+                )
+            )
         if result.error:
             log.write(Text(result.error, style="#f85149"))
-        if self._needs_sync:
-            self._show_pending_status()
-        else:
-            self._show_ready_status()
+        self._show_repl_ready_status()
 
     def _handle_command(self, command: str) -> None:
         log = self.query_one("#repl-log", RichLog)
@@ -423,9 +576,10 @@ class ScrappadApp(App[None]):
 
     def _start_variable_inspection(self) -> None:
         self._execution_kind = "repl"
-        status = self.query_one("#status", Static)
-        status.update("● Inspecting variables… Ctrl+C to interrupt")
-        status.styles.color = "#58a6ff"
+        self._show_repl_waiting()
+        self._set_repl_status(
+            "Inspecting variables… Ctrl+C to interrupt", "#58a6ff"
+        )
         self._execution_task = asyncio.create_task(self._finish_variable_inspection())
 
     async def _finish_variable_inspection(self) -> None:
@@ -456,10 +610,8 @@ class ScrappadApp(App[None]):
             log.write(table)
         else:
             log.write("No names are currently defined.")
-        if self._needs_sync:
-            self._show_pending_status()
-        else:
-            self._show_ready_status()
+        self._show_repl_ready_status()
+        self._show_repl_ready()
 
     def action_switch_pane(self) -> None:
         editor = self.query_one("#editor", TextArea)
@@ -479,7 +631,9 @@ class ScrappadApp(App[None]):
         self._start_editor_sync(force=True)
 
     def action_interrupt(self) -> None:
-        if self._execution_kind is None:
+        if self._execution_kind is None or (
+            self._execution_kind == "repl" and self._active_pane == "editor"
+        ):
             focused = self.focused
             copy_action = getattr(focused, "action_copy", None)
             if callable(copy_action):
@@ -488,9 +642,7 @@ class ScrappadApp(App[None]):
 
         execution_kind = self._execution_kind
         if self.kernel.interrupt():
-            status = self.query_one("#status", Static)
-            status.update("● Interrupting Python…")
-            status.styles.color = "#d29922"
+            self._set_repl_status("Interrupting Python…", "#d29922")
             if execution_kind == "editor":
                 self.query_one("#editor", TextArea).focus()
 
@@ -503,13 +655,7 @@ class ScrappadApp(App[None]):
         except OSError as exc:
             self.notify(f"Could not save: {exc}", severity="error")
             return
-        self._dirty = False
-        self._update_editor_title()
         self.notify(f"Saved {self.path}")
 
     def action_clear_repl(self) -> None:
         self.query_one("#repl-log", RichLog).clear()
-
-    def _update_editor_title(self) -> None:
-        marker = " ●" if self._dirty else ""
-        self.query_one("#editor-title", Label).update(f"EDITOR  {self.path}{marker}")

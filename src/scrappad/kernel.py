@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import multiprocessing
 import os
 import signal
 import threading
-from dataclasses import dataclass
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Literal
@@ -66,24 +69,49 @@ class KernelClient:
         self._process.start()
         child.close()
 
-    async def sync(self, source: str) -> KernelResponse:
-        return await self._request({"operation": "sync", "source": source})
+    async def sync(
+        self,
+        source: str,
+        on_output: Callable[[str], None] | None = None,
+    ) -> KernelResponse:
+        return await self._request(
+            {"operation": "sync", "source": source},
+            on_output=on_output,
+        )
 
-    async def reset(self, source: str) -> KernelResponse:
-        return await self._request({"operation": "reset", "source": source})
+    async def reset(
+        self,
+        source: str,
+        on_output: Callable[[str], None] | None = None,
+    ) -> KernelResponse:
+        return await self._request(
+            {"operation": "reset", "source": source},
+            on_output=on_output,
+        )
 
-    async def execute(self, command: str) -> KernelResponse:
-        return await self._request({"operation": "execute", "command": command})
+    async def execute(
+        self,
+        command: str,
+        on_output: Callable[[str], None] | None = None,
+    ) -> KernelResponse:
+        return await self._request(
+            {"operation": "execute", "command": command},
+            on_output=on_output,
+        )
 
     async def variables(self) -> KernelResponse:
         return await self._request({"operation": "variables"})
 
-    async def _request(self, message: dict[str, str]) -> KernelResponse:
+    async def _request(
+        self,
+        message: dict[str, str],
+        on_output: Callable[[str], None] | None = None,
+    ) -> KernelResponse:
         if self._closed:
             return KernelResponse("error", error="Python worker is closed.")
         self._request_in_flight.set()
         try:
-            return await asyncio.to_thread(self._round_trip, message)
+            return await asyncio.to_thread(self._round_trip, message, on_output)
         except (BrokenPipeError, EOFError, OSError):
             return KernelResponse(
                 "error",
@@ -94,7 +122,11 @@ class KernelClient:
             self._request_in_flight.clear()
             self._interrupt_requested.clear()
 
-    def _round_trip(self, message: dict[str, str]) -> KernelResponse:
+    def _round_trip(
+        self,
+        message: dict[str, str],
+        on_output: Callable[[str], None] | None,
+    ) -> KernelResponse:
         self._connection.send(message)
         acknowledgement = self._connection.recv()
         if acknowledgement != "started":
@@ -102,10 +134,36 @@ class KernelClient:
         self._request_active.set()
         if self._interrupt_requested.is_set():
             self._send_interrupt()
-        response = self._connection.recv()
-        if not isinstance(response, KernelResponse):
-            raise TypeError("Invalid response from Python worker")
-        return response
+        captured_chunks: list[str] = []
+        captured_length = 0
+        output_truncated = False
+        while True:
+            response = self._connection.recv()
+            if (
+                isinstance(response, tuple)
+                and len(response) == 2
+                and response[0] == "output"
+                and isinstance(response[1], str)
+            ):
+                chunk = response[1]
+                if on_output is not None:
+                    on_output(chunk)
+                else:
+                    remaining = 100_000 - captured_length
+                    if remaining > 0:
+                        captured_chunks.append(chunk[:remaining])
+                        captured_length += min(len(chunk), remaining)
+                    if len(chunk) > max(remaining, 0):
+                        output_truncated = True
+                continue
+            if not isinstance(response, KernelResponse):
+                raise TypeError("Invalid response from Python worker")
+            if on_output is None and captured_chunks:
+                output = "".join(captured_chunks)
+                if output_truncated:
+                    output += "\n... <output truncated>\n"
+                response = replace(response, output=output + response.output)
+            return response
 
     def interrupt(self) -> bool:
         """Interrupt active Python code while keeping the worker namespace alive."""
@@ -155,7 +213,7 @@ def _kernel_main(connection: Connection, filename: str) -> None:
             signal.signal(signal.SIGINT, signal.default_int_handler)
             connection.send("started")
             try:
-                response = _dispatch(runtime, operation, message)
+                response = _dispatch(runtime, operation, message, connection)
             except KeyboardInterrupt:
                 response = KernelResponse(
                     "error",
@@ -182,9 +240,14 @@ def _dispatch(
     runtime: PythonRuntime,
     operation: str | None,
     message: dict[str, str],
+    connection: Connection,
 ) -> KernelResponse:
     if operation == "sync":
-        result = runtime.sync(message["source"])
+        output = _StreamingOutput(connection)
+        try:
+            result = runtime.sync(message["source"], output_stream=output)
+        finally:
+            output.finish()
         return KernelResponse(
             result.state,
             output=result.output,
@@ -193,7 +256,11 @@ def _dispatch(
             symbol_count=len(runtime.visible_names),
         )
     if operation == "reset":
-        result = runtime.reset(message["source"])
+        output = _StreamingOutput(connection)
+        try:
+            result = runtime.reset(message["source"], output_stream=output)
+        finally:
+            output.finish()
         return KernelResponse(
             result.state,
             output=result.output,
@@ -202,7 +269,11 @@ def _dispatch(
             symbol_count=len(runtime.visible_names),
         )
     if operation == "execute":
-        result = runtime.execute(message["command"])
+        output = _StreamingOutput(connection)
+        try:
+            result = runtime.execute(message["command"], output_stream=output)
+        finally:
+            output.finish()
         rendered = display_value(result.value) if result.has_value else ""
         return KernelResponse(
             "error" if result.error else "ok",
@@ -228,3 +299,60 @@ def _dispatch(
         error=f"Unknown worker operation: {operation}",
         symbol_count=len(runtime.visible_names),
     )
+
+
+class _StreamingOutput(io.TextIOBase):
+    """Send stdout and stderr to the client in reasonably sized chunks."""
+
+    def __init__(
+        self,
+        connection: Connection,
+        chunk_size: int = 256,
+        pacing_seconds: float = 0.05,
+        large_write_size: int = 4_096,
+    ) -> None:
+        self.connection = connection
+        self.chunk_size = chunk_size
+        self.pacing_seconds = pacing_seconds
+        self.large_write_size = large_write_size
+        self._buffer = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            raise TypeError("output must be text")
+        original_length = len(text)
+        if len(text) >= self.large_write_size:
+            if self._buffer:
+                self._emit(self._buffer)
+                self._buffer = ""
+            while len(text) >= self.large_write_size:
+                self._emit(text[: self.large_write_size], pacing_seconds=0.005)
+                text = text[self.large_write_size :]
+        self._buffer += text
+        while len(self._buffer) >= self.chunk_size:
+            split_at = self._buffer.rfind("\n", 0, self.chunk_size + 1)
+            split_at = self.chunk_size if split_at < 0 else split_at + 1
+            self._emit(self._buffer[:split_at])
+            self._buffer = self._buffer[split_at:]
+        return original_length
+
+    def flush(self) -> None:
+        if self._buffer:
+            self._emit(self._buffer)
+            self._buffer = ""
+
+    def finish(self) -> None:
+        if self._buffer:
+            self._emit(self._buffer, pacing_seconds=0)
+            self._buffer = ""
+
+    def _emit(self, text: str, pacing_seconds: float | None = None) -> None:
+        self.connection.send(("output", text))
+        pacing_seconds = (
+            self.pacing_seconds if pacing_seconds is None else pacing_seconds
+        )
+        if pacing_seconds:
+            time.sleep(pacing_seconds)
