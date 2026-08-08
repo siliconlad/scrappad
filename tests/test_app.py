@@ -1,8 +1,9 @@
 import asyncio
 
+from rich.style import Style
 from textual.widgets import Footer, RichLog, Static, TextArea
 
-from scrappad.app import ReplInput, ScrappadApp
+from scrappad.app import EDITOR_SYNTAX_THEME, ReplInput, ScrappadApp
 
 
 async def wait_for_idle(app: ScrappadApp, timeout: float = 3) -> None:
@@ -51,6 +52,16 @@ def test_split_panes_repl_history_and_save(tmp_path) -> None:
             await pilot.pause()
             editor = app.query_one("#editor", TextArea)
             assert editor.has_focus
+            assert editor.language == "python"
+            assert editor.theme == EDITOR_SYNTAX_THEME
+            assert editor._highlight_query is not None
+            highlight_names = {
+                name
+                for row in editor._highlights.values()
+                for _, _, name in row
+            }
+            expected_highlights = {"keyword.function", "keyword.return", "string"}
+            assert expected_highlights <= highlight_names
             assert app._needs_sync is True
 
             await pilot.press("ctrl+right")
@@ -60,9 +71,25 @@ def test_split_panes_repl_history_and_save(tmp_path) -> None:
             assert app._symbol_count == 2
             for character in "greet('Ada')":
                 await pilot.press(character)
+            live_input_colors = {
+                str(span.style.color)
+                for span in repl_input._value.spans
+                if isinstance(span.style, Style) and span.style.color is not None
+            }
+            assert len(live_input_colors) >= 2
             await pilot.press("enter")
             await wait_for_idle(app)
             assert repl_input.value == ""
+            log = app.query_one("#repl-log", RichLog)
+            submitted_line = next(
+                line for line in log.lines if line.text == ">>> greet('Ada')"
+            )
+            submitted_colors = {
+                str(segment.style.color)
+                for segment in submitted_line._segments
+                if segment.style is not None and segment.style.color is not None
+            }
+            assert len(submitted_colors) >= 2
 
             await pilot.press("up")
             assert repl_input.value == "greet('Ada')"
@@ -174,6 +201,46 @@ def test_editor_changes_load_only_when_entering_repl(tmp_path) -> None:
             assert "SyntaxError" in app._last_error
             retained = await app.kernel.execute("answer")
             assert retained.display == "99"
+
+    asyncio.run(exercise_app())
+
+
+def test_repl_draft_is_withdrawn_during_editor_sync_and_restored(tmp_path) -> None:
+    async def exercise_app() -> None:
+        app = ScrappadApp(tmp_path / "draft-during-sync.py")
+
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.press("ctrl+right")
+            repl_input = app.query_one("#repl-input", ReplInput)
+            prompt = app.query_one("#repl-prompt", Static)
+            repl_input.value = "pending_call(1)"
+            assert repl_input.selection.is_empty
+
+            await pilot.press("ctrl+left")
+            app.query_one("#editor", TextArea).text = "while True: pass\n"
+            await pilot.press("ctrl+right")
+            await wait_for_execution(app, "editor")
+
+            assert prompt.display is False
+            assert repl_input.value == ""
+
+            await pilot.press("ctrl+c")
+            await wait_for_idle(app)
+
+            assert prompt.display is True
+            assert repl_input.value == "pending_call(1)"
+            assert repl_input.selection.is_empty
+
+            app.query_one("#editor", TextArea).text = (
+                "import time\ntime.sleep(0.1)\nanswer = 42\n"
+            )
+            await pilot.press("ctrl+right")
+            await wait_for_execution(app, "editor")
+            assert repl_input.value == ""
+            await wait_for_idle(app)
+            assert prompt.display is True
+            assert repl_input.value == "pending_call(1)"
+            assert repl_input.selection.is_empty
 
     asyncio.run(exercise_app())
 
@@ -330,6 +397,10 @@ def test_ctrl_c_interrupts_repl_without_losing_worker(tmp_path) -> None:
                 or segment.style.bgcolor.is_default
                 for segment in result_line._segments
             )
+            assert all(
+                segment.style is None or segment.style.color is None
+                for segment in result_line._segments
+            )
 
     asyncio.run(exercise_app())
 
@@ -343,6 +414,7 @@ def test_new_scratchpad_is_empty_and_repl_starts_clean(tmp_path) -> None:
             assert app.query_one("#editor", TextArea).text == ""
             repl_input = app.query_one("#repl-input", ReplInput)
             assert repl_input.placeholder == "expression or :help"
+            assert repl_input.select_on_focus is False
             assert str(app.query_one("#repl-prompt", Static).content) == ">>>"
             assert app.query_one("#repl-input", ReplInput).region.height == 1
             assert app.query_one("#repl-input-row").region.height == 1
@@ -352,12 +424,14 @@ def test_new_scratchpad_is_empty_and_repl_starts_clean(tmp_path) -> None:
             )
             log = app.query_one("#repl-log", RichLog)
             assert log.lines == []
+            assert log.highlight is False
             assert log.wrap is True
             assert log.styles.scrollbar_size_horizontal == 0
             assert log.styles.scrollbar_size_vertical == 0
             editor = app.query_one("#editor", TextArea)
             assert editor.soft_wrap is True
             assert editor.highlight_cursor_line is False
+            assert editor.styles.background == log.styles.background
             assert editor.styles.scrollbar_size_horizontal == 0
             assert editor.styles.scrollbar_size_vertical == 0
             assert list(app.query(Footer)) == []
@@ -378,6 +452,51 @@ def test_new_scratchpad_is_empty_and_repl_starts_clean(tmp_path) -> None:
                 < app.query_one("#file-path", Static).region.x
                 < app.query_one("#repl-status", Static).region.x
             )
+
+    asyncio.run(exercise_app())
+
+
+def test_repl_and_editor_use_identical_tree_sitter_colors(tmp_path) -> None:
+    async def exercise_app() -> None:
+        source = "while True: pass"
+        app = ScrappadApp(tmp_path / "matching-highlights.py")
+
+        async with app.run_test(size=(120, 24)) as pilot:
+            editor = app.query_one("#editor", TextArea)
+            repl_input = app.query_one("#repl-input", ReplInput)
+            editor.text = source
+            repl_input.value = source
+            await pilot.pause()
+
+            editor_colors: list[str | None] = []
+            repl_colors: list[str | None] = []
+            for offset in (0, 6, 12):
+                editor_color = None
+                for start, end, name in editor._highlights[0]:
+                    if start <= offset < end:
+                        style = editor._theme.syntax_styles.get(name)
+                        if style is not None and style.color is not None:
+                            editor_color = str(style.color)
+                editor_colors.append(editor_color)
+
+                repl_color = None
+                for span in repl_input._value.spans:
+                    if span.start <= offset < span.end:
+                        style = span.style
+                        if isinstance(style, Style) and style.color is not None:
+                            repl_color = str(style.color)
+                repl_colors.append(repl_color)
+
+            assert repl_colors == editor_colors
+            assert editor_colors[0] == editor_colors[2]
+            assert editor_colors[0] != editor_colors[1]
+            assert editor._theme.syntax_styles["boolean"].italic is False
+            true_style = next(
+                span.style
+                for span in repl_input._value.spans
+                if span.start <= 6 < span.end and isinstance(span.style, Style)
+            )
+            assert true_style.italic is False
 
     asyncio.run(exercise_app())
 

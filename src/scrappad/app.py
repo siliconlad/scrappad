@@ -6,7 +6,9 @@ import asyncio
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from rich.syntax import Syntax
+import tree_sitter_python
+from rich.highlighter import Highlighter
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import events
@@ -14,10 +16,74 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, RichLog, Static, TextArea
+from textual.widgets.text_area import TextAreaTheme
+from tree_sitter import Language, Parser, Query, QueryCursor
 
 from scrappad.kernel import KernelClient, KernelResponse
 
 STARTER_TEXT = ""
+SYNTAX_THEME = "monokai"
+EDITOR_SYNTAX_THEME = "scrappad-monokai"
+
+_monokai_text_area_theme = TextAreaTheme.get_builtin_theme(SYNTAX_THEME)
+if _monokai_text_area_theme is None:  # pragma: no cover - supplied by Textual
+    raise RuntimeError("Textual's Monokai theme is unavailable")
+_python_syntax_styles = _monokai_text_area_theme.syntax_styles.copy()
+for _upright_token in ("boolean", "constant.builtin"):
+    _python_syntax_styles[_upright_token] += Style(italic=False)
+_editor_text_area_theme = TextAreaTheme(
+    name=EDITOR_SYNTAX_THEME,
+    syntax_styles=_python_syntax_styles,
+)
+_python_language = Language(tree_sitter_python.language())
+_python_highlight_query = Query(
+    _python_language,
+    TextArea._get_builtin_highlight_query("python"),
+)
+
+
+class PythonSyntaxHighlighter(Highlighter):
+    """Highlight REPL input with the editor's Tree-sitter token styles."""
+
+    def __init__(self) -> None:
+        self._parser = Parser(_python_language)
+        self._cached_source: str | None = None
+        self._cached_spans: list[tuple[int, int, Style]] = []
+
+    def highlight(self, text: Text) -> None:
+        source = text.plain
+        if source != self._cached_source:
+            self._cached_source = source
+            self._cached_spans = self._parse_spans(source)
+        for start, end, style in self._cached_spans:
+            text.stylize(style, start, end)
+
+    def _parse_spans(self, source: str) -> list[tuple[int, int, Style]]:
+        source_bytes = source.encode("utf-8")
+        tree = self._parser.parse(source_bytes)
+        captures = QueryCursor(_python_highlight_query).captures(tree.root_node)
+
+        byte_to_codepoint = {0: 0}
+        byte_offset = 0
+        for codepoint, character in enumerate(source, start=1):
+            byte_offset += len(character.encode("utf-8"))
+            byte_to_codepoint[byte_offset] = codepoint
+
+        spans: list[tuple[int, int, Style]] = []
+        get_style = _editor_text_area_theme.syntax_styles.get
+        for capture_name, nodes in captures.items():
+            style = get_style(capture_name)
+            if style is None:
+                continue
+            for node in nodes:
+                start = byte_to_codepoint.get(node.start_byte)
+                end = byte_to_codepoint.get(node.end_byte)
+                if start is not None and end is not None:
+                    spans.append((start, end, style))
+        return spans
+
+
+PYTHON_HIGHLIGHTER = PythonSyntaxHighlighter()
 
 
 class ReplInput(Input):
@@ -28,6 +94,8 @@ class ReplInput(Input):
         self.history: list[str] = []
         self.history_index = 0
         self._draft = ""
+        self._withdrawn_value = ""
+        self._withdrawn_selection = None
         self.busy = False
 
     def remember(self, command: str) -> None:
@@ -35,6 +103,25 @@ class ReplInput(Input):
             self.history.append(command)
         self.history_index = len(self.history)
         self._draft = ""
+
+    def withdraw_draft(self) -> None:
+        """Temporarily remove the draft while Python is busy."""
+        if self._withdrawn_selection is not None:
+            return
+        self._withdrawn_value = self.value
+        self._withdrawn_selection = self.selection
+        self.value = ""
+
+    def restore_draft(self) -> None:
+        """Restore a draft withdrawn while Python was busy."""
+        selection = self._withdrawn_selection
+        if selection is None:
+            return
+        value = self._withdrawn_value
+        self._withdrawn_value = ""
+        self._withdrawn_selection = None
+        self.value = value
+        self.selection = selection
 
     def on_key(self, event: events.Key) -> None:
         if self.busy:
@@ -220,7 +307,7 @@ class ScrappadApp(App[None]):
     def compose(self) -> ComposeResult:
         with Horizontal(id="workspace"):
             with Vertical(classes="pane", id="editor-pane"):
-                yield TextArea(
+                editor = TextArea(
                     self.source,
                     language="python",
                     show_line_numbers=True,
@@ -229,10 +316,13 @@ class ScrappadApp(App[None]):
                     highlight_cursor_line=False,
                     id="editor",
                 )
+                editor.register_theme(_editor_text_area_theme)
+                editor.theme = EDITOR_SYNTAX_THEME
+                yield editor
             with Vertical(classes="pane", id="repl-pane"):
                 yield RichLog(
                     id="repl-log",
-                    highlight=True,
+                    highlight=False,
                     markup=False,
                     wrap=True,
                     max_lines=2_000,
@@ -242,6 +332,8 @@ class ScrappadApp(App[None]):
                     yield ReplInput(
                         id="repl-input",
                         placeholder="expression or :help",
+                        highlighter=PYTHON_HIGHLIGHTER,
+                        select_on_focus=False,
                     )
         with Horizontal(id="bottom-bar"):
             yield Static(classes="bar-item", id="editor-status")
@@ -307,6 +399,7 @@ class ScrappadApp(App[None]):
     def _show_repl_waiting(self) -> None:
         repl_input = self.query_one("#repl-input", ReplInput)
         self._restore_repl_focus = repl_input.has_focus
+        repl_input.withdraw_draft()
         repl_input.busy = True
         repl_input.placeholder = ""
         self.query_one("#repl-prompt", Static).display = False
@@ -314,6 +407,7 @@ class ScrappadApp(App[None]):
     def _show_repl_ready(self, *, restore_focus: bool = True) -> None:
         repl_input = self.query_one("#repl-input", ReplInput)
         repl_input.busy = False
+        repl_input.restore_draft()
         repl_input.placeholder = "expression or :help"
         self.query_one("#repl-prompt", Static).display = True
         if restore_focus and self._restore_repl_focus:
@@ -491,7 +585,7 @@ class ScrappadApp(App[None]):
         repl_input.remember(command)
         log = self.query_one("#repl-log", RichLog)
         prompt = Text(">>> ", style="bold #58a6ff")
-        prompt.append(command, style="#d8dee9")
+        prompt.append(PYTHON_HIGHLIGHTER(command))
         log.write(prompt)
 
         if command.startswith(":"):
@@ -540,14 +634,7 @@ class ScrappadApp(App[None]):
         if result.output:
             log.write(result.output.rstrip("\n"))
         if result.has_display:
-            log.write(
-                Syntax(
-                    result.display,
-                    "python",
-                    word_wrap=True,
-                    background_color="default",
-                )
-            )
+            log.write(result.display)
         if result.error:
             log.write(Text(result.error, style="#f85149"))
         self._show_repl_ready_status()

@@ -16,7 +16,7 @@ is too cramped and a notebook is too much.
 
 <p align="center">
   <img
-    src="https://raw.githubusercontent.com/siliconlad/scrappad/main/docs/assets/scrappad-demo.svg"
+    src="docs/assets/scrappad-demo.svg"
     alt="Scrappad showing Python source beside a live REPL"
     width="100%"
   >
