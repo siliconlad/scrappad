@@ -351,6 +351,7 @@ class ScrappadApp(App[None]):
         self.call_after_refresh(self._fit_repl_log)
 
     def on_unmount(self) -> None:
+        self._cancel_editor_status_timer()
         execution_task = self._execution_task
         self._execution_task = None
         self._execution_kind = None

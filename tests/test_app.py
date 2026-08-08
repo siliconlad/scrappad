@@ -140,7 +140,6 @@ def test_save_status_is_transient_and_tracks_current_editor_state(
 
             app.path = tmp_path
             await pilot.press("ctrl+s")
-            await pilot.pause()
             assert "Could not save" in str(status.content)
 
     asyncio.run(exercise_app())
