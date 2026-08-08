@@ -3,11 +3,15 @@ import asyncio
 from scrappad.kernel import KernelClient
 
 
+def discard_output(_: str) -> None:
+    pass
+
+
 def test_worker_namespace_and_interrupts_are_transactional(tmp_path) -> None:
     async def exercise_kernel() -> None:
         kernel = KernelClient(tmp_path / "kernel.py")
         try:
-            loaded = await kernel.sync("value = 1")
+            loaded = await kernel.sync("value = 1", on_output=discard_output)
             assert loaded.state == "ok"
             assert loaded.symbol_count == 1
 
@@ -26,23 +30,25 @@ def test_worker_namespace_and_interrupts_are_transactional(tmp_path) -> None:
             assert kernel.interrupt() is True
             interrupted = await asyncio.wait_for(editor_loop, 3)
             assert interrupted.interrupted is True
-            assert interrupted.output == ""
             assert "<output truncated>" not in "".join(editor_output)
 
-            retained = await kernel.execute("value")
+            retained = await kernel.execute("value", on_output=discard_output)
             assert retained.display == "1"
 
-            repl_loop = asyncio.create_task(kernel.execute("while True: pass"))
+            repl_loop = asyncio.create_task(
+                kernel.execute("while True: pass", on_output=discard_output)
+            )
             await asyncio.sleep(0.2)
             assert kernel.interrupt() is True
             interrupted = await asyncio.wait_for(repl_loop, 3)
             assert interrupted.interrupted is True
 
-            usable = await kernel.execute("value + 1")
+            usable = await kernel.execute("value + 1", on_output=discard_output)
             assert usable.display == "2"
 
-            printed = await kernel.execute("print('hello')")
-            assert printed.output == "hello\n"
+            printed_output: list[str] = []
+            await kernel.execute("print('hello')", on_output=printed_output.append)
+            assert "".join(printed_output) == "hello\n"
 
             output_chunks: list[str] = []
             printing_loop = asyncio.create_task(
@@ -60,7 +66,6 @@ def test_worker_namespace_and_interrupts_are_transactional(tmp_path) -> None:
             interrupted = await asyncio.wait_for(printing_loop, 3)
             assert interrupted.interrupted is True
             assert interrupted.error == "KeyboardInterrupt"
-            assert interrupted.output == ""
             assert "<output truncated>" not in "".join(output_chunks)
         finally:
             kernel.close()

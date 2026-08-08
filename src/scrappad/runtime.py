@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ast
 import builtins
-import codeop
 import contextlib
 import io
 import traceback
@@ -18,48 +17,22 @@ from pathlib import Path
 from types import CodeType
 from typing import Any, Literal
 
-SyncState = Literal["ok", "incomplete", "error"]
+SyncState = Literal["ok", "error"]
 
 
 @dataclass(frozen=True)
 class SyncResult:
     state: SyncState
-    output: str = ""
     error: str = ""
     interrupted: bool = False
 
 
 @dataclass(frozen=True)
 class ReplResult:
-    output: str = ""
     value: Any = None
     has_value: bool = False
     error: str = ""
     interrupted: bool = False
-
-
-class _BoundedOutput(io.StringIO):
-    """Capture user output without allowing an infinite print loop to exhaust RAM."""
-
-    def __init__(self, limit: int = 100_000) -> None:
-        super().__init__()
-        self.limit = limit
-        self.truncated = False
-
-    def write(self, text: str) -> int:
-        original_length = len(text)
-        remaining = self.limit - self.tell()
-        if remaining > 0:
-            super().write(text[:remaining])
-        if original_length > max(remaining, 0):
-            self.truncated = True
-        return original_length
-
-    def getvalue(self) -> str:
-        value = super().getvalue()
-        if self.truncated:
-            value += "\n... <output truncated>\n"
-        return value
 
 
 def _format_exception() -> str:
@@ -96,7 +69,6 @@ class PythonRuntime:
         self.filename = str(filename)
         self.namespace: dict[str, Any] = self._base_namespace()
         self._editor_names: set[str] = set()
-        self.last_source = ""
 
     def _base_namespace(self) -> dict[str, Any]:
         return {
@@ -116,20 +88,16 @@ class PythonRuntime:
 
     def _compile_editor(self, source: str) -> tuple[CodeType | None, SyncResult | None]:
         try:
-            # compile_command distinguishes code that is temporarily incomplete
-            # while someone is in the middle of typing a block.
-            maybe_code = codeop.compile_command(source, self.filename, "exec")
+            code = compile(source, self.filename, "exec")
         except (SyntaxError, OverflowError, ValueError):
             return None, SyncResult("error", error=_format_exception())
-
-        if maybe_code is None:
-            return None, SyncResult("incomplete")
-        return maybe_code, None
+        return code, None
 
     def sync(
         self,
         source: str,
-        output_stream: io.TextIOBase | None = None,
+        *,
+        output_stream: io.TextIOBase,
     ) -> SyncResult:
         """Execute editor source and atomically publish it on success."""
 
@@ -146,33 +114,22 @@ class PythonRuntime:
             if name not in self._editor_names and not name.startswith("__")
         )
         before = dict(candidate)
-        capture_output = output_stream is None
-        stdout = _BoundedOutput() if capture_output else output_stream
-        stderr = _BoundedOutput() if capture_output else output_stream
-        assert stdout is not None
-        assert stderr is not None
-
-        def captured_output() -> str:
-            if not capture_output:
-                return ""
-            assert isinstance(stdout, _BoundedOutput)
-            assert isinstance(stderr, _BoundedOutput)
-            return stdout.getvalue() + stderr.getvalue()
 
         try:
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with (
+                contextlib.redirect_stdout(output_stream),
+                contextlib.redirect_stderr(output_stream),
+            ):
                 exec(code, candidate, candidate)  # noqa: S102 - this is a Python REPL
         except KeyboardInterrupt:
             return SyncResult(
                 "error",
-                output=captured_output(),
                 error="KeyboardInterrupt",
                 interrupted=True,
             )
         except BaseException:  # noqa: BLE001 - report user exceptions in the REPL
             return SyncResult(
                 "error",
-                output=captured_output(),
                 error=_format_exception(),
             )
 
@@ -185,17 +142,16 @@ class PythonRuntime:
         }
         self._editor_names = statically_bound | changed_or_new
         self.namespace = candidate
-        self.last_source = source
-        return SyncResult("ok", output=captured_output())
+        return SyncResult("ok")
 
     def reset(
         self,
-        source: str | None = None,
-        output_stream: io.TextIOBase | None = None,
+        source: str,
+        *,
+        output_stream: io.TextIOBase,
     ) -> SyncResult:
         """Discard REPL scratch names and rebuild from the editor."""
 
-        source = self.last_source if source is None else source
         previous_namespace = self.namespace
         previous_editor_names = self._editor_names
         self.namespace = self._base_namespace()
@@ -209,32 +165,26 @@ class PythonRuntime:
     def execute(
         self,
         command: str,
-        output_stream: io.TextIOBase | None = None,
+        *,
+        output_stream: io.TextIOBase,
     ) -> ReplResult:
         """Execute one REPL command, displaying the final expression if present."""
-
-        capture_output = output_stream is None
-        stdout = _BoundedOutput() if capture_output else output_stream
-        stderr = _BoundedOutput() if capture_output else output_stream
-        assert stdout is not None
-        assert stderr is not None
-
-        def captured_output() -> str:
-            if not capture_output:
-                return ""
-            assert isinstance(stdout, _BoundedOutput)
-            assert isinstance(stderr, _BoundedOutput)
-            return stdout.getvalue() + stderr.getvalue()
 
         try:
             module = ast.parse(command, self.filename, mode="exec")
             expression: ast.expr | None = None
+            # exec() runs statements but cannot return the value of a trailing
+            # expression. Split that expression out and eval() it after the
+            # preceding statements so commands behave like an interactive REPL.
             if module.body and isinstance(module.body[-1], ast.Expr):
                 expression = module.body.pop().value
 
             value: Any = None
             has_value = False
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with (
+                contextlib.redirect_stdout(output_stream),
+                contextlib.redirect_stderr(output_stream),
+            ):
                 if module.body:
                     exec(  # noqa: S102 - this is a Python REPL
                         compile(module, self.filename, "exec"),
@@ -249,19 +199,16 @@ class PythonRuntime:
                     )
                     has_value = value is not None
             return ReplResult(
-                output=captured_output(),
                 value=value,
                 has_value=has_value,
             )
         except KeyboardInterrupt:
             return ReplResult(
-                output=captured_output(),
                 error="KeyboardInterrupt",
                 interrupted=True,
             )
         except BaseException:  # noqa: BLE001 - report user exceptions in the REPL
             return ReplResult(
-                output=captured_output(),
                 error=_format_exception(),
             )
 
@@ -279,19 +226,20 @@ def _top_level_bound_names(source: str) -> set[str]:
 
 
 class _ModuleBindingCollector(ast.NodeVisitor):
-    """Collect module bindings while not descending into nested scopes."""
+    """Collect names that editor source intends to own at module scope.
+
+    Comparing the namespace before and after execution is not sufficient: an
+    assignment can rebind a REPL name to the same object, and a binding inside
+    untaken control flow makes no runtime change. A normal AST walk is too broad
+    because function locals and comprehension targets are not module bindings.
+    The stdlib symtable module also exposes inlined comprehension targets as
+    module symbols on Python 3.12+, even though those targets do not leak.
+    This scope-aware walk supplies the static half of editor-name tracking;
+    namespace comparison still catches dynamic bindings made by exec or import *.
+    """
 
     def __init__(self) -> None:
         self.names: set[str] = set()
-
-    def _target(self, node: ast.AST) -> None:
-        if isinstance(node, ast.Name):
-            self.names.add(node.id)
-        elif isinstance(node, (ast.Tuple, ast.List)):
-            for element in node.elts:
-                self._target(element)
-        elif isinstance(node, ast.Starred):
-            self._target(node.value)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -352,6 +300,20 @@ class _ModuleBindingCollector(ast.NodeVisitor):
             self.names.add(node.name)
         for statement in node.body:
             self.visit(statement)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name:
+            self.names.add(node.name)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest:
+            self.names.add(node.rest)
+        self.generic_visit(node)
 
     def visit_arg(self, node: ast.arg) -> None:
         # Arguments belong to nested scopes, not the module.

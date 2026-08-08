@@ -103,6 +103,49 @@ def test_split_panes_repl_history_and_save(tmp_path) -> None:
     asyncio.run(exercise_app())
 
 
+def test_save_status_is_transient_and_tracks_current_editor_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def exercise_app() -> None:
+        path = tmp_path / "save-status.py"
+        app = ScrappadApp(path)
+
+        async with app.run_test(size=(120, 24)) as pilot:
+            monkeypatch.setattr(
+                "scrappad.app.EDITOR_STATUS_NOTICE_DURATION",
+                0.1,
+            )
+            editor = app.query_one("#editor", TextArea)
+            status = app.query_one("#editor-status", Static)
+            editor.text = "answer = 42\n"
+            await pilot.pause()
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert "Saved" in str(status.content)
+            assert path.read_text(encoding="utf-8") == editor.text
+
+            await asyncio.sleep(0.15)
+            await pilot.pause()
+            assert "Changes pending" in str(status.content)
+
+            await pilot.press("ctrl+s")
+            editor.text = "answer = 43\n"
+            await pilot.pause()
+            assert "Changes pending" in str(status.content)
+            await asyncio.sleep(0.15)
+            await pilot.pause()
+            assert "Changes pending" in str(status.content)
+
+            app.path = tmp_path
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert "Could not save" in str(status.content)
+
+    asyncio.run(exercise_app())
+
+
 def test_layout_responds_to_terminal_width(tmp_path) -> None:
     async def exercise_app() -> None:
         app = ScrappadApp(tmp_path / "responsive.py")
@@ -155,7 +198,7 @@ def test_editor_changes_load_only_when_entering_repl(tmp_path) -> None:
             editor = app.query_one("#editor", TextArea)
             await pilot.press("ctrl+right")
             await wait_for_idle(app)
-            initial = await app.kernel.execute("answer")
+            initial = await app.kernel.execute("answer", on_output=lambda _: None)
             assert initial.display == "42"
 
             await pilot.press("ctrl+left")
@@ -175,31 +218,31 @@ def test_editor_changes_load_only_when_entering_repl(tmp_path) -> None:
 
             editor.text = "answer = 99\n"
             await pilot.pause()
-            unchanged = await app.kernel.execute("answer")
+            unchanged = await app.kernel.execute("answer", on_output=lambda _: None)
             assert unchanged.display == "42"
 
             # Waiting does not trigger the old debounced auto-reload behavior.
             await asyncio.sleep(0.7)
             await pilot.pause()
-            unchanged = await app.kernel.execute("answer")
+            unchanged = await app.kernel.execute("answer", on_output=lambda _: None)
             assert unchanged.display == "42"
 
             await pilot.press("ctrl+right")
             await wait_for_idle(app)
-            updated = await app.kernel.execute("answer")
+            updated = await app.kernel.execute("answer", on_output=lambda _: None)
             assert updated.display == "99"
 
             await pilot.press("ctrl+left")
             editor.text = "answer = !\n"
             await pilot.pause()
             assert app._last_error == ""
-            retained = await app.kernel.execute("answer")
+            retained = await app.kernel.execute("answer", on_output=lambda _: None)
             assert retained.display == "99"
 
             await pilot.click("#repl-input")
             await wait_for_idle(app)
             assert "SyntaxError" in app._last_error
-            retained = await app.kernel.execute("answer")
+            retained = await app.kernel.execute("answer", on_output=lambda _: None)
             assert retained.display == "99"
 
     asyncio.run(exercise_app())
@@ -276,11 +319,10 @@ def test_ctrl_c_interrupts_editor_and_allows_unchanged_retry(tmp_path) -> None:
                 app.query_one("#repl-status", Static).content
             )
 
-            # Starting from the editor and then switching to the REPL remains
-            # interruptible from the REPL input too.
-            await pilot.press("f5")
-            await wait_for_execution(app, "editor")
+            # Re-entering the REPL retries the unchanged editor source and
+            # remains interruptible from the REPL input.
             await pilot.press("ctrl+right")
+            await wait_for_execution(app, "editor")
             assert app.query_one("#repl-input", ReplInput).has_focus
             await pilot.press("ctrl+c")
             await wait_for_idle(app)
@@ -323,12 +365,6 @@ def test_ctrl_c_interrupts_repl_without_losing_worker(tmp_path) -> None:
             await pilot.press("ctrl+right")
             status = str(app.query_one("#repl-status", Static).content)
             assert "Running REPL" in status
-            assert "Python is already running" not in status
-
-            await pilot.press("f5")
-            assert "Python is already running" in str(
-                app.query_one("#repl-status", Static).content
-            )
 
             await pilot.press("ctrl+left")
             assert "Running REPL" in str(
@@ -614,7 +650,6 @@ def test_clicking_repl_during_editor_execution_restores_focus(tmp_path) -> None:
             assert app._active_pane == "repl"
             status = str(app.query_one("#repl-status", Static).content)
             assert "Running editor" in status
-            assert "Python is already running" not in status
 
             await pilot.press("ctrl+c")
             await wait_for_idle(app)
