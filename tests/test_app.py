@@ -122,7 +122,6 @@ def test_save_status_is_transient_and_tracks_current_editor_state(
             await pilot.pause()
 
             await pilot.press("ctrl+s")
-            await pilot.pause()
             assert "Saved" in str(status.content)
             assert path.read_text(encoding="utf-8") == editor.text
 
