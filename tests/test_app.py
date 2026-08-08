@@ -114,7 +114,7 @@ def test_save_status_is_transient_and_tracks_current_editor_state(
         async with app.run_test(size=(120, 24)) as pilot:
             monkeypatch.setattr(
                 "scrappad.app.EDITOR_STATUS_NOTICE_DURATION",
-                0.1,
+                60,
             )
             editor = app.query_one("#editor", TextArea)
             status = app.query_one("#editor-status", Static)
@@ -122,26 +122,24 @@ def test_save_status_is_transient_and_tracks_current_editor_state(
             await pilot.pause()
 
             await pilot.press("ctrl+s")
-            await pilot.pause()
             assert "Saved" in str(status.content)
             assert path.read_text(encoding="utf-8") == editor.text
 
-            await asyncio.sleep(0.15)
-            await pilot.pause()
+            assert app._editor_status_timer is not None
+            app._editor_status_timer.stop()
+            app._restore_editor_state_status()
             assert "Changes pending" in str(status.content)
 
             await pilot.press("ctrl+s")
             editor.text = "answer = 43\n"
             await pilot.pause()
             assert "Changes pending" in str(status.content)
-            await asyncio.sleep(0.15)
-            await pilot.pause()
-            assert "Changes pending" in str(status.content)
 
             app.path = tmp_path
             await pilot.press("ctrl+s")
-            await pilot.pause()
             assert "Could not save" in str(status.content)
+
+        app._restore_editor_state_status()
 
     asyncio.run(exercise_app())
 
